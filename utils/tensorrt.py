@@ -1,7 +1,7 @@
 from contextlib import ExitStack
 import logging
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import tensorrt as trt
@@ -23,7 +23,7 @@ class MemoryBuffer:
         self.device = device
 
 
-class InferenceModel:
+class InferenceEngine:
     def __init__(
         self,
         onnx_path: Union[str, Path],
@@ -33,20 +33,20 @@ class InferenceModel:
         fp16_mode: bool = True,
         force_rebuild: bool = False,
     ):
-        self.onnx_path = Path(onnx_path)
-        self.engine_path = Path(engine_path)
-        self.max_batch_size = max_batch_size
-        self.workspace_size = workspace_size
-        self.fp16_mode = fp16_mode
-        self.force_rebuild = force_rebuild
+        self.onnx_path: Union[str, Path] = Path(onnx_path)
+        self.engine_path: Union[str, Path] = Path(engine_path)
+        self.max_batch_size: int = max_batch_size
+        self.workspace_size: int = workspace_size
+        self.fp16_mode: bool = fp16_mode
+        self.force_rebuild: bool = force_rebuild
 
-        self.logger = None
-        self.engine = None
-        self.context = None
-        self.stream = None
-        self.input_buffers = None
-        self.output_buffers = None
-        self.bindings = None
+        self.logger: trt.tensorrt.Logger = None
+        self.engine: trt.tensorrt.ICudaEngine = None
+        self.context: trt.tensorrt.IExecutionContext = None
+        self.stream: cuda.Stream = None
+        self.input_buffers: List[MemoryBuffer] = None
+        self.output_buffers: List[MemoryBuffer] = None
+        self.bindings: List[int] = None
 
         self._init_logger()
         self._init_engine()
@@ -58,7 +58,6 @@ class InferenceModel:
 
     def _init_engine(self):
         if not self.force_rebuild and self.engine_path.exists():
-            logger.info("Loading %s..." % self.engine_path)
             with trt.Runtime(self.logger) as runtime:
                 with open(self.engine_path, "rb") as f:
                     engine_data = f.read()
@@ -116,6 +115,15 @@ class InferenceModel:
                 buffer = MemoryBuffer(dtype, shape, host_mem, device)
                 self.output_buffers.append(buffer)
 
+    def _check_init_success(self):
+        assert self.logger is not None
+        assert self.engine is not None
+        assert self.context is not None
+        assert self.stream is not None
+        assert self.input_buffers is not None
+        assert self.output_buffers is not None
+        assert self.bindings is not None
+
     def _execute_inference(self):
         # copy inputs: host -> device
         for ib in self.input_buffers:
@@ -136,6 +144,9 @@ class InferenceModel:
         self.stream.synchronize()
 
     def __call__(self, inputs: List[np.ndarray]):
+        # ensure that the inference engine is initialized
+        self._check_init_success()
+
         batch_outputs = []
         total_batch_size = inputs[0].shape[0]
         for i in range(0, total_batch_size, self.max_batch_size):
