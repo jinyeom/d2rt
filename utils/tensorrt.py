@@ -1,6 +1,7 @@
 from contextlib import ExitStack
+import logging
 from pathlib import Path
-from typing import Union, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 import tensorrt as trt
@@ -11,11 +12,13 @@ from pycuda import driver as cuda
 class MemoryBuffer:
     def __init__(
         self,
-        mem_dtype: np.dtype,
+        dtype: np.dtype,
+        shape: Tuple[int, ...],
         host: Optional[np.ndarray] = None,
         device: Optional[cuda.DeviceAllocation] = None,
     ):
-        self.mem_dtype = mem_dtype
+        self.dtype = dtype
+        self.shape = shape
         self.host = host
         self.device = device
 
@@ -36,31 +39,38 @@ class InferenceModel:
         self.workspace_size = workspace_size
         self.fp16_mode = fp16_mode
         self.force_rebuild = force_rebuild
+
+        self.logger = None
+        self.engine = None
+        self.context = None
+        self.stream = None
+        self.input_buffers = None
+        self.output_buffers = None
+        self.bindings = None
+
+        self._init_logger()
         self._init_engine()
         self._init_buffers()
 
-    def _init_engine(self):
-        print("Building TensorRT engine from %s..." % self.onnx_path, flush=True)
-
+    def _init_logger(self):
         self.logger = trt.Logger(trt.Logger.Severity.INFO)
         trt.init_libnvinfer_plugins(self.logger, "")
 
+    def _init_engine(self):
         if not self.force_rebuild and self.engine_path.exists():
-            print("Loading %s" % self.engine_path, flush=True)
+            logger.info("Loading %s..." % self.engine_path)
             with trt.Runtime(self.logger) as runtime:
                 with open(self.engine_path, "rb") as f:
                     engine_data = f.read()
                 self.engine = runtime.deserialize_cuda_engine(engine_data)
             return
 
-        explicit_batch = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-
         with ExitStack() as stack:
+            explicit_batch = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
             builder = stack.enter_context(trt.Builder(self.logger))
             network = stack.enter_context(builder.create_network(explicit_batch))
             parser = stack.enter_context(trt.OnnxParser(network, self.logger))
 
-            # configure builder
             builder.max_workspace_size = self.workspace_size << 30
             builder.max_batch_size = self.max_batch_size
             builder.fp16_mode = self.fp16_mode
@@ -80,13 +90,12 @@ class InferenceModel:
                     )
                     raise RuntimeError(msg)
 
-                self.engine = builder.build_cuda_engine(network)
-                with open(self.engine_path, "wb") as f:
-                    f.write(self.engine.serialize())
+            self.engine = builder.build_cuda_engine(network)
+            self.context = self.engine.create_execution_context()
+            with open(self.engine_path, "wb") as f:
+                f.write(self.engine.serialize())
 
     def _init_buffers(self):
-        print("Allocating memory buffers...", flush=True)
-
         self.stream = cuda.Stream()
         self.input_buffers = []
         self.output_buffers = []
@@ -94,16 +103,42 @@ class InferenceModel:
 
         for binding in self.engine:
             dtype = np.dtype(trt.nptype(self.engine.get_binding_dtype(binding)))
-            binding_shape = self.engine.get_binding_shape(binding)
-            size = trt.volume(binding_shape) * self.engine.max_batch_size
-            device_mem = cuda.mem_alloc(size * dtype.itemsize)
-            self.bindings.append(int(device_mem))
+            shape = self.engine.get_binding_shape(binding)
+            size = trt.volume(shape) * self.engine.max_batch_size
+            device = cuda.mem_alloc(size * dtype.itemsize)
+            self.bindings.append(int(device))
 
             if self.engine.binding_is_input(binding):
-                self.input_buffers.append(MemoryBuffer(dtype, None, device_mem))
+                buffer = MemoryBuffer(dtype, shape, None, device)
+                self.input_buffers.append(buffer)
             else:
                 host_mem = cuda.pagelocked_empty(size, dtype)
-                self.output_buffers.append(MemoryBuffer(dtype, host_mem, device_mem))
+                buffer = MemoryBuffer(dtype, shape, host_mem, device)
+                self.output_buffers.append(buffer)
 
-    def __call__(self):
+    def _execute_inference(self):
+        for ib in self.input_buffers:
+            cuda.memcpy_htod_async(ib.device, ib.host, self.stream)
+        self.context.execute_async(
+            batch_size=self.max_batch_size,
+            bindings=self.bindings,
+            stream_handle=self.stream.handle,
+        )
+        for ob in output_buffers:
+            cuda.memcpy_dtoh_async(ob.host, ob.device, self.stream)
+        self.stream.synchronize()
+
+    def __call__(self, inputs: List[np.ndarray]):
+        for i in range(0, len(inputs[0]), self.max_batch_size):
+            for x, ib in zip(inputs, self.input_buffers):
+                batch_input = x[i : i + self.max_batch_size]
+                ib.host = np.ascontiguousarray(batch_input, dtype=ib.mem_dtype)
+
+            self._execute_inference()
+
+            batch_outputs = [
+                np.reshape(ob.host, (self.max_batch_size, *ob.shape))
+                for ob in self.output_buffers
+            ]
+
         raise NotImplementedError
