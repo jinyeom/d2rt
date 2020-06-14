@@ -135,3 +135,6 @@ dmypy.json
 *.pkl
 *.onnx
 *.engine
+
+# Datasets
+datasets/
