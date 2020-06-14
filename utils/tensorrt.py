@@ -117,28 +117,45 @@ class InferenceModel:
                 self.output_buffers.append(buffer)
 
     def _execute_inference(self):
+        # copy inputs: host -> device
         for ib in self.input_buffers:
             cuda.memcpy_htod_async(ib.device, ib.host, self.stream)
+
+        # execute inference
         self.context.execute_async(
             batch_size=self.max_batch_size,
             bindings=self.bindings,
             stream_handle=self.stream.handle,
         )
+
+        # copy outputs: device -> host
         for ob in output_buffers:
             cuda.memcpy_dtoh_async(ob.host, ob.device, self.stream)
+
+        # synchronize
         self.stream.synchronize()
 
     def __call__(self, inputs: List[np.ndarray]):
-        for i in range(0, len(inputs[0]), self.max_batch_size):
+        batch_outputs = []
+        total_batch_size = inputs[0].shape[0]
+        for i in range(0, total_batch_size, self.max_batch_size):
+            # copy `self.max_batch_size` batch of images into each input buffer
             for x, ib in zip(inputs, self.input_buffers):
-                batch_input = x[i : i + self.max_batch_size]
-                ib.host = np.ascontiguousarray(batch_input, dtype=ib.mem_dtype)
+                batch = x[i : i + self.max_batch_size]
+                ib.host = np.ascontiguousarray(batch, dtype=ib.mem_dtype)
 
+            # execute inference with the current batch
             self._execute_inference()
 
-            batch_outputs = [
+            # retrieve outputs in their desired shapes
+            outputs = [
                 np.reshape(ob.host, (self.max_batch_size, *ob.shape))
                 for ob in self.output_buffers
             ]
+            batch_outputs.append(outputs)
 
-        raise NotImplementedError
+        batch_outputs = [
+            np.concatenate(output, axis=0)[:total_batch_size]
+            for output in zip(*batch_outputs)
+        ]
+        return batch_outputs
