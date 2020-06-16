@@ -51,6 +51,7 @@ class InferenceEngine:
         self._init_logger()
         self._init_engine()
         self._init_buffers()
+        self._check_init()
 
     def _init_logger(self):
         self.logger = trt.Logger(trt.Logger.Severity.INFO)
@@ -62,6 +63,7 @@ class InferenceEngine:
                 with open(self.engine_path, "rb") as f:
                     engine_data = f.read()
                 self.engine = runtime.deserialize_cuda_engine(engine_data)
+                self.context = self.engine.create_execution_context()
             return
 
         with ExitStack() as stack:
@@ -108,14 +110,15 @@ class InferenceEngine:
             self.bindings.append(int(device))
 
             if self.engine.binding_is_input(binding):
-                buffer = MemoryBuffer(dtype, shape, None, device)
+                host = None  # will be added during inference
+                buffer = MemoryBuffer(dtype, shape, host, device)
                 self.input_buffers.append(buffer)
             else:
-                host_mem = cuda.pagelocked_empty(size, dtype)
-                buffer = MemoryBuffer(dtype, shape, host_mem, device)
+                host = cuda.pagelocked_empty(size, dtype)
+                buffer = MemoryBuffer(dtype, shape, host, device)
                 self.output_buffers.append(buffer)
 
-    def _check_init_success(self):
+    def _check_init(self):
         assert self.logger is not None
         assert self.engine is not None
         assert self.context is not None
@@ -123,6 +126,10 @@ class InferenceEngine:
         assert self.input_buffers is not None
         assert self.output_buffers is not None
         assert self.bindings is not None
+
+    def _validate_inputs(self, inputs: List[np.ndarray]):
+        for x, ib in zip(inputs, self.input_buffers):
+            assert x.shape == ib.shape
 
     def _execute_inference(self):
         # copy inputs: host -> device
@@ -137,15 +144,14 @@ class InferenceEngine:
         )
 
         # copy outputs: device -> host
-        for ob in output_buffers:
+        for ob in self.output_buffers:
             cuda.memcpy_dtoh_async(ob.host, ob.device, self.stream)
 
         # synchronize
         self.stream.synchronize()
 
     def __call__(self, inputs: List[np.ndarray]):
-        # ensure that the inference engine is initialized
-        self._check_init_success()
+        self._validate_inputs(inputs)
 
         batch_outputs = []
         total_batch_size = inputs[0].shape[0]
@@ -153,7 +159,7 @@ class InferenceEngine:
             # copy `self.max_batch_size` batch of images into each input buffer
             for x, ib in zip(inputs, self.input_buffers):
                 batch = x[i : i + self.max_batch_size]
-                ib.host = np.ascontiguousarray(batch, dtype=ib.mem_dtype)
+                ib.host = np.ascontiguousarray(batch, dtype=ib.dtype)
 
             # execute inference with the current batch
             self._execute_inference()
