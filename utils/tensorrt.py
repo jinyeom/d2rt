@@ -40,13 +40,13 @@ class InferenceEngine:
         self.fp16_mode: bool = fp16_mode
         self.force_rebuild: bool = force_rebuild
 
-        self.logger: trt.tensorrt.Logger = None
-        self.engine: trt.tensorrt.ICudaEngine = None
-        self.context: trt.tensorrt.IExecutionContext = None
-        self.stream: cuda.Stream = None
-        self.input_buffers: List[MemoryBuffer] = None
-        self.output_buffers: List[MemoryBuffer] = None
-        self.bindings: List[int] = None
+        self._logger: trt.tensorrt.Logger = None
+        self._engine: trt.tensorrt.ICudaEngine = None
+        self._context: trt.tensorrt.IExecutionContext = None
+        self._stream: cuda.Stream = None
+        self._input_buffers: List[MemoryBuffer] = None
+        self._output_buffers: List[MemoryBuffer] = None
+        self._bindings: List[int] = None
 
         self._init_logger()
         self._init_engine()
@@ -54,23 +54,23 @@ class InferenceEngine:
         self._check_init()
 
     def _init_logger(self):
-        self.logger = trt.Logger(trt.Logger.Severity.INFO)
-        trt.init_libnvinfer_plugins(self.logger, "")
+        self._logger = trt.Logger(trt.Logger.Severity.INFO)
+        trt.init_libnvinfer_plugins(self._logger, "")
 
     def _init_engine(self):
         if not self.force_rebuild and self.engine_path.exists():
-            with trt.Runtime(self.logger) as runtime:
+            with trt.Runtime(self._logger) as runtime:
                 with open(self.engine_path, "rb") as f:
                     engine_data = f.read()
-                self.engine = runtime.deserialize_cuda_engine(engine_data)
-                self.context = self.engine.create_execution_context()
+                self._engine = runtime.deserialize_cuda_engine(engine_data)
+                self._context = self._engine.create_execution_context()
             return
 
         with ExitStack() as stack:
             explicit_batch = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-            builder = stack.enter_context(trt.Builder(self.logger))
+            builder = stack.enter_context(trt.Builder(self._logger))
             network = stack.enter_context(builder.create_network(explicit_batch))
-            parser = stack.enter_context(trt.OnnxParser(network, self.logger))
+            parser = stack.enter_context(trt.OnnxParser(network, self._logger))
 
             builder.max_workspace_size = self.workspace_size << 30
             builder.max_batch_size = self.max_batch_size
@@ -91,88 +91,85 @@ class InferenceEngine:
                     )
                     raise RuntimeError(msg)
 
-            self.engine = builder.build_cuda_engine(network)
-            self.context = self.engine.create_execution_context()
+            self._engine = builder.build_cuda_engine(network)
+            self._context = self._engine.create_execution_context()
             with open(self.engine_path, "wb") as f:
-                f.write(self.engine.serialize())
+                f.write(self._engine.serialize())
 
     def _init_buffers(self):
-        self.stream = cuda.Stream()
-        self.input_buffers = []
-        self.output_buffers = []
-        self.bindings = []
+        self._stream = cuda.Stream()
+        self._input_buffers = []
+        self._output_buffers = []
+        self._bindings = []
 
-        for binding in self.engine:
-            dtype = np.dtype(trt.nptype(self.engine.get_binding_dtype(binding)))
-            shape = self.engine.get_binding_shape(binding)
-            size = trt.volume(shape) * self.engine.max_batch_size
+        for binding in self._engine:
+            dtype = np.dtype(trt.nptype(self._engine.get_binding_dtype(binding)))
+            shape = self._engine.get_binding_shape(binding)
+            size = trt.volume(shape) * self._engine.max_batch_size
             device = cuda.mem_alloc(size * dtype.itemsize)
-            self.bindings.append(int(device))
+            self._bindings.append(int(device))
 
-            if self.engine.binding_is_input(binding):
+            if self._engine.binding_is_input(binding):
                 host = None  # will be added during inference
                 buffer = MemoryBuffer(dtype, shape, host, device)
-                self.input_buffers.append(buffer)
+                self._input_buffers.append(buffer)
             else:
                 host = cuda.pagelocked_empty(size, dtype)
                 buffer = MemoryBuffer(dtype, shape, host, device)
-                self.output_buffers.append(buffer)
+                self._output_buffers.append(buffer)
 
     def _check_init(self):
-        assert self.logger is not None
-        assert self.engine is not None
-        assert self.context is not None
-        assert self.stream is not None
-        assert self.input_buffers is not None
-        assert self.output_buffers is not None
-        assert self.bindings is not None
+        assert self._logger is not None
+        assert self._engine is not None
+        assert self._context is not None
+        assert self._stream is not None
+        assert self._input_buffers is not None
+        assert self._output_buffers is not None
+        assert self._bindings is not None
 
     def _validate_inputs(self, inputs: List[np.ndarray]):
-        for x, ib in zip(inputs, self.input_buffers):
-            assert x.shape == ib.shape
+        total_batch_size = inputs[0].shape[0]
+        for x, ib in zip(inputs, self._input_buffers):
+            assert x.shape[0] == total_batch_size, "inconsistent batch size"
+            assert x.shape[1:] == ib.shape[1:], "invalid image shape"
 
     def _execute_inference(self):
-        # copy inputs: host -> device
-        for ib in self.input_buffers:
-            cuda.memcpy_htod_async(ib.device, ib.host, self.stream)
+        for ib in self._input_buffers:
+            cuda.memcpy_htod_async(ib.device, ib.host, self._stream)
 
-        # execute inference
-        self.context.execute_async(
-            batch_size=self.max_batch_size,
-            bindings=self.bindings,
-            stream_handle=self.stream.handle,
+        self._context.execute_async(
+            batch_size=self._engine.max_batch_size,
+            bindings=self._bindings,
+            stream_handle=self._stream.handle,
         )
 
-        # copy outputs: device -> host
-        for ob in self.output_buffers:
-            cuda.memcpy_dtoh_async(ob.host, ob.device, self.stream)
+        for ob in self._output_buffers:
+            cuda.memcpy_dtoh_async(ob.host, ob.device, self._stream)
 
-        # synchronize
-        self.stream.synchronize()
+        self._stream.synchronize()
 
-    def __call__(self, inputs: List[np.ndarray]):
+    def predict(self, inputs: List[np.ndarray]):
         self._validate_inputs(inputs)
 
         batch_outputs = []
         total_batch_size = inputs[0].shape[0]
-        for i in range(0, total_batch_size, self.max_batch_size):
-            # copy `self.max_batch_size` batch of images into each input buffer
-            for x, ib in zip(inputs, self.input_buffers):
-                batch = x[i : i + self.max_batch_size]
+        for i in range(0, total_batch_size, self._engine.max_batch_size):
+            for x, ib in zip(inputs, self._input_buffers):
+                batch = x[i : i + self._engine.max_batch_size]
                 ib.host = np.ascontiguousarray(batch, dtype=ib.dtype)
 
-            # execute inference with the current batch
             self._execute_inference()
 
-            # retrieve outputs in their desired shapes
             outputs = [
-                np.reshape(ob.host, (self.max_batch_size, *ob.shape))
-                for ob in self.output_buffers
+                np.reshape(ob.host, (self._engine.max_batch_size, *ob.shape))
+                for ob in self._output_buffers
             ]
             batch_outputs.append(outputs)
 
-        batch_outputs = [
+        return [
             np.concatenate(output, axis=0)[:total_batch_size]
             for output in zip(*batch_outputs)
         ]
-        return batch_outputs
+
+    def __call__(self, inputs: List[np.ndarray]):
+        return self.predict(inputs)
