@@ -30,7 +30,6 @@ class _RetinaNet(nn.Module):
         self.backbone = model.backbone
         self.head = model.head
         self.anchor_generator = model.anchor_generator
-        self.box_transformer = model.box2box_transform
         self.in_features = model.in_features
         self.num_classes = model.num_classes
         self.device = model.device
