@@ -23,7 +23,7 @@ class MemoryBuffer:
         self.device = device
 
 
-class InferenceEngine:
+class InferenceCore:
     def __init__(
         self,
         onnx_path: Union[str, Path],

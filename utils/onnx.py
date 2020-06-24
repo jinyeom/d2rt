@@ -54,7 +54,7 @@ def onnx_export(
     simplify: bool = True,
 ):
     assert len(input_shape) == 4, "input_shape must be (N, C, H, W)"
-    wrapped_model = _RetinaNet(model.eval())
+    wrapped_model = _RetinaNet(model).eval().to(model.device)
     dummy_input = torch.rand(input_shape).to(wrapped_model.device)
     torch.onnx.export(
         wrapped_model,
