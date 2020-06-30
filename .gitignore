@@ -132,6 +132,7 @@ dmypy.json
 .vscode/
 
 # Artifacts
+*.npy
 *.pkl
 *.onnx
 *.engine

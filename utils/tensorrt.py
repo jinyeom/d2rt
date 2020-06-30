@@ -160,10 +160,7 @@ class InferenceCore:
 
             self._execute_inference()
 
-            outputs = [
-                np.reshape(ob.host, (self._engine.max_batch_size, *ob.shape))
-                for ob in self._output_buffers
-            ]
+            outputs = [np.reshape(ob.host, ob.shape) for ob in self._output_buffers]
             batch_outputs.append(outputs)
 
         return [

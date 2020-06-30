@@ -1,6 +1,7 @@
 from typing import List, Tuple, Union
 from pathlib import Path
 
+import numpy as np
 import onnx
 from onnxsim import simplify as onnx_simplify
 
@@ -45,14 +46,17 @@ class _RetinaNet(nn.Module):
         return [torch.cat([d, c], dim=-1) for d, c in zip(box_delta, box_cls)]
 
 
-def onnx_export(
+def deploy(
     model: RetinaNet,
     path: Union[str, Path],
     input_shape: Tuple[int, int, int, int] = (1, 3, 540, 960),
     opset_version: int = 10,
     verbose: bool = True,
     simplify: bool = True,
-):
+) -> Path:
+    path = Path(path)
+    output_dir = path.parent
+    # export the RetinaNet model as an ONNX file
     assert len(input_shape) == 4, "input_shape must be (N, C, H, W)"
     wrapped_model = _RetinaNet(model).eval().to(model.device)
     dummy_input = torch.rand(input_shape).to(wrapped_model.device)
@@ -68,4 +72,19 @@ def onnx_export(
         simple_onnx, success = onnx_simplify(str(path), perform_optimization=True)
         assert success, "failed to simplify the exported ONNX file"
         onnx.save(simple_onnx, str(path))
-    return path
+    # export anchors as a NumPy file
+    anchors = []
+    cell_anchors = wrapped_model.anchor_generator.cell_anchors
+    strides = wrapped_model.anchor_generator.strides
+    grid_offset = wrapped_model.anchor_generator.offset
+    for cell_anchor, stride in zip(cell_anchors, strides):
+        cell_anchor = cell_anchor.cpu().numpy()
+        x = np.arange(0, input_shape[3], stride) + grid_offset * stride
+        y = np.arange(0, input_shape[2], stride) + grid_offset * stride
+        grid = np.meshgrid(x, y)
+        grid = np.concatenate([grid, grid])
+        grid = np.transpose(grid[None], [2, 3, 0, 1])
+        anchors.append(np.reshape(grid + cell_anchor, [-1, 4]))
+    anchors_path = path.parent / "{}_anchors.npy".format(path.stem)
+    np.save(anchors_path, anchors, allow_pickle=True)
+    return output_dir
