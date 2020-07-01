@@ -1,4 +1,4 @@
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Optional, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +50,8 @@ def deploy(
     model: RetinaNet,
     path: Union[str, Path],
     input_shape: Tuple[int, int, int, int] = (1, 3, 540, 960),
+    input_names: Optional[Sequence[str]] = None,
+    output_names: Optional[Sequence[str]] = None,
     opset_version: int = 10,
     verbose: bool = True,
     simplify: bool = True,
@@ -64,6 +66,8 @@ def deploy(
         wrapped_model,
         dummy_input,
         path,
+        input_names=input_names,
+        output_names=output_names,
         opset_version=opset_version,
         verbose=verbose,
         keep_initializers_as_inputs=True,
