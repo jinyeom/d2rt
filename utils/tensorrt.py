@@ -1,57 +1,65 @@
-from contextlib import ExitStack
+import contextlib
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Sequence
 
-import numpy as np
+import torch
+from torch import nn
 import tensorrt as trt
-from pycuda import autoinit
-from pycuda import driver as cuda
 
 
-class MemoryBuffer:
-    def __init__(
-        self,
-        dtype: np.dtype,
-        shape: Tuple[int, ...],
-        host: Optional[np.ndarray] = None,
-        device: Optional[cuda.DeviceAllocation] = None,
-    ):
-        self.dtype = dtype
-        self.shape = shape
-        self.host = host
-        self.device = device
+def device_trt2torch(device: trt.TensorLocation) -> torch.device:
+    if device == trt.TensorLocation.DEVICE:
+        return torch.device("cuda")
+    elif device == trt.TensorLocation.HOST:
+        return torch.device("cpu")
+    else:
+        raise TypeError("invalid device: %s" % device)
 
 
-class InferenceCore:
+def dtype_trt2torch(dtype: trt.DataType) -> torch.dtype:
+    if dtype == trt.int8:
+        return torch.int8
+    elif dtype == trt.bool:
+        assert trt_version() >= "7.0"
+        return torch.bool
+    elif dtype == trt.int32:
+        return torch.int32
+    elif dtype == trt.float16:
+        return torch.float16
+    elif dtype == trt.float32:
+        return torch.float32
+    else:
+        raise TypeError("invalid dtype: %s" % dtype)
+
+
+class TensorRTModule(nn.Module):
     def __init__(
         self,
         onnx_path: Union[str, Path],
         engine_path: Union[str, Path],
         max_batch_size: int = 1,
-        workspace_size: int = 1,
-        fp16_mode: bool = True,
+        max_workspace_size: int = 1 << 25,
+        fp16_mode: bool = False,
         force_rebuild: bool = False,
     ):
-        self.onnx_path: Union[str, Path] = Path(onnx_path)
-        self.engine_path: Union[str, Path] = Path(engine_path)
+        super().__init__()
+        self.onnx_path: Path = Path(onnx_path)
+        self.engine_path: Path = Path(engine_path)
         self.max_batch_size: int = max_batch_size
-        self.workspace_size: int = workspace_size
+        self.max_workspace_size: int = max_workspace_size
         self.fp16_mode: bool = fp16_mode
         self.force_rebuild: bool = force_rebuild
 
-        self._logger: trt.tensorrt.Logger = None
-        self._engine: trt.tensorrt.ICudaEngine = None
-        self._context: trt.tensorrt.IExecutionContext = None
-        self._stream: cuda.Stream = None
-        self._input_buffers: List[MemoryBuffer] = None
-        self._output_buffers: List[MemoryBuffer] = None
-        self._bindings: List[int] = None
+        self._logger: trt.Logger = None
+        self._engine: trt.ICudaEngine = None
+        self._context: trt.IExecutionContext = None
+        self._input_names: List[str] = None
+        self._output_names: List[str] = None
 
         self._init_logger()
         self._init_engine()
-        self._init_buffers()
-        self._check_init()
+        self._init_names()
 
     def _init_logger(self):
         self._logger = trt.Logger(trt.Logger.Severity.INFO)
@@ -66,13 +74,13 @@ class InferenceCore:
                 self._context = self._engine.create_execution_context()
             return
 
-        with ExitStack() as stack:
+        with contextlib.ExitStack() as stack:
             explicit_batch = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
             builder = stack.enter_context(trt.Builder(self._logger))
             network = stack.enter_context(builder.create_network(explicit_batch))
             parser = stack.enter_context(trt.OnnxParser(network, self._logger))
 
-            builder.max_workspace_size = self.workspace_size << 30
+            builder.max_workspace_size = self.max_workspace_size
             builder.max_batch_size = self.max_batch_size
             builder.fp16_mode = self.fp16_mode
             builder.strict_type_constraints = True
@@ -96,77 +104,40 @@ class InferenceCore:
             with open(self.engine_path, "wb") as f:
                 f.write(self._engine.serialize())
 
-    def _init_buffers(self):
-        self._stream = cuda.Stream()
-        self._input_buffers = []
-        self._output_buffers = []
-        self._bindings = []
-
-        for binding in self._engine:
-            dtype = np.dtype(trt.nptype(self._engine.get_binding_dtype(binding)))
-            shape = self._engine.get_binding_shape(binding)
-            size = trt.volume(shape) * self._engine.max_batch_size
-            device = cuda.mem_alloc(size * dtype.itemsize)
-            self._bindings.append(int(device))
-
-            if self._engine.binding_is_input(binding):
-                host = None  # will be added during inference
-                buffer = MemoryBuffer(dtype, shape, host, device)
-                self._input_buffers.append(buffer)
+    def _init_names(self):
+        self._input_names = []
+        self._output_names = []
+        for index in range(self._engine.num_bindings):
+            name = self._engine.get_binding_name(index)
+            if self._engine.binding_is_input(index):
+                self._input_names.append(name)
             else:
-                host = cuda.pagelocked_empty(size, dtype)
-                buffer = MemoryBuffer(dtype, shape, host, device)
-                self._output_buffers.append(buffer)
+                self._output_names.append(name)
 
-    def _check_init(self):
-        assert self._logger is not None
-        assert self._engine is not None
-        assert self._context is not None
-        assert self._stream is not None
-        assert self._input_buffers is not None
-        assert self._output_buffers is not None
-        assert self._bindings is not None
+    def forward(self, inputs: Sequence[torch.Tensor]) -> Tuple[torch.Tensor]:
+        batch_size = inputs[0].shape[0]
+        bindings = [None] * self._engine.num_bindings
 
-    def _validate_inputs(self, inputs: List[np.ndarray]):
-        total_batch_size = inputs[0].shape[0]
-        for x, ib in zip(inputs, self._input_buffers):
-            assert x.shape[0] == total_batch_size, "inconsistent batch size"
-            assert x.shape[1:] == ib.shape[1:], "invalid image shape"
+        for i, input_name in enumerate(self._input_names):
+            index = self._engine.get_binding_index(input_name)
+            dtype = dtype_trt2torch(self._engine.get_binding_dtype(index))
+            device = device_trt2torch(self._engine.get_location(index))
+            x = inputs[i].to(dtype).to(device).contiguous()
+            bindings[index] = x.data_ptr()
 
-    def _execute_inference(self):
-        for ib in self._input_buffers:
-            cuda.memcpy_htod_async(ib.device, ib.host, self._stream)
+        outputs = []
+        for output_name in self._output_names:
+            index = self._engine.get_binding_index(output_name)
+            shape = (batch_size, *self._engine.get_binding_shape(index)[1:])
+            dtype = dtype_trt2torch(self._engine.get_binding_dtype(index))
+            device = device_trt2torch(self._engine.get_location(index))
+            output = torch.empty(shape, dtype=dtype, device=device)
+            outputs.append(output)
+            bindings[index] = output.data_ptr()
 
+        stream = torch.cuda.current_stream()
         self._context.execute_async(
-            batch_size=self._engine.max_batch_size,
-            bindings=self._bindings,
-            stream_handle=self._stream.handle,
+            batch_size=batch_size, bindings=bindings, stream_handle=stream.cuda_stream,
         )
-
-        for ob in self._output_buffers:
-            cuda.memcpy_dtoh_async(ob.host, ob.device, self._stream)
-
-        self._stream.synchronize()
-
-    def predict(self, inputs: List[np.ndarray]):
-        self._validate_inputs(inputs)
-
-        batch_outputs = []
-        total_batch_size = inputs[0].shape[0]
-        for i in range(0, total_batch_size, self._engine.max_batch_size):
-            for x, ib in zip(inputs, self._input_buffers):
-                batch = x[i : i + self._engine.max_batch_size]
-                ib.host = np.ascontiguousarray(batch, dtype=ib.dtype)
-
-            self._execute_inference()
-
-            outputs = [np.reshape(ob.host, ob.shape) for ob in self._output_buffers]
-            batch_outputs.append(outputs)
-
-        return [
-            np.concatenate(output, axis=0)[:total_batch_size]
-            for output in zip(*batch_outputs)
-        ]
-
-    def __call__(self, inputs: List[np.ndarray]):
-        return self.predict(inputs)
+        stream.synchronize()
+        return outputs
