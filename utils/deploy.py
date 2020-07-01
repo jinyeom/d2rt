@@ -88,7 +88,8 @@ def deploy(
         grid = np.meshgrid(x, y)
         grid = np.concatenate([grid, grid])
         grid = np.transpose(grid[None], [2, 3, 0, 1])
-        anchors.append(np.reshape(grid + cell_anchor, [-1, 4]))
-    anchors_path = path.parent / "{}_anchors.npy".format(path.stem)
-    np.save(anchors_path, anchors, allow_pickle=True)
+        anchor = np.reshape(grid + cell_anchor, [-1, 4])
+        anchors.append(torch.from_numpy(anchor))
+    anchors_path = path.parent / "{}_anchors.pt".format(path.stem)
+    torch.save(anchors, anchors_path)
     return output_dir
