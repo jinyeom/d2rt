@@ -58,6 +58,7 @@ def deploy(
 ) -> Path:
     path = Path(path)
     output_dir = path.parent
+
     # export the RetinaNet model as an ONNX file
     assert len(input_shape) == 4, "input_shape must be (N, C, H, W)"
     wrapped_model = _RetinaNet(model).eval().to(model.device)
@@ -76,7 +77,9 @@ def deploy(
         simple_onnx, success = onnx_simplify(str(path), perform_optimization=True)
         assert success, "failed to simplify the exported ONNX file"
         onnx.save(simple_onnx, str(path))
-    # export anchors as a NumPy file
+
+    # export anchors as a PyTorch file
+    # TODO: use PyTorch operators instead
     anchors = []
     cell_anchors = wrapped_model.anchor_generator.cell_anchors
     strides = wrapped_model.anchor_generator.strides
@@ -92,4 +95,5 @@ def deploy(
         anchors.append(torch.from_numpy(anchor))
     anchors_path = path.parent / "{}_anchors.pt".format(path.stem)
     torch.save(anchors, anchors_path)
+
     return output_dir
