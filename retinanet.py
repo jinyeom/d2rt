@@ -12,21 +12,7 @@ from utils.tensorrt import TensorRTModule
 
 
 class RetinaNetRT(nn.Module):
-    # TODO: clean up the interface a bit
-    # TODO: get `image_size` elsewhere
-
-    def __init__(
-        self,
-        cfg: CfgNode,
-        onnx_path: Union[str, Path],
-        engine_path: Union[str, Path],
-        anchors_path: Union[str, Path],
-        image_size: Tuple[int, int],
-        max_batch_size: int = 1,
-        max_workspace_size: int = 1 << 25,
-        fp16_mode: bool = False,
-        force_rebuild: bool = False,
-    ):
+    def __init__(self, cfg: CfgNode):
         super().__init__()
         # fmt: off
         self.num_classes              = cfg.MODEL.RETINANET.NUM_CLASSES
@@ -37,19 +23,19 @@ class RetinaNetRT(nn.Module):
         # fmt: on
 
         self.model = TensorRTModule(
-            onnx_path,
-            engine_path,
-            max_batch_size=max_batch_size,
-            max_workspace_size=max_workspace_size,
-            fp16_mode=fp16_mode,
-            force_rebuild=force_rebuild,
+            cfg.MODEL.DEPLOY.ONNX_PATH,
+            cfg.MODEL.DEPLOY.ENGINE_PATH,
+            max_batch_size=cfg.MODEL.DEPLOY.MAX_BATCH_SIZE,
+            max_workspace_size=cfg.MODEL.DEPLOY.MAX_WORKSPACE_SIZE,
+            fp16_mode=cfg.MODEL.DEPLOY.FP16_MODE,
+            force_rebuild=cfg.MODEL.DEPLOY.FORCE_REBUILD,
         )
-        self.anchors = torch.load(anchors_path)
+        self.anchors = torch.load(cfg.MODEL.DEPLOY.ANCHORS_PATH)
         self.anchors = [anchor.cuda() for anchor in self.anchors]
         self.box2box_transform = Box2BoxTransform(
             weights=cfg.MODEL.RPN.BBOX_REG_WEIGHTS
         )
-        self.image_size = image_size
+        self.image_size = cfg.MODEL.DEPLOY.INPUT_SHAPE[-2:]
 
     def forward(self, inputs: torch.Tensor):
         outputs = self.model([inputs])
